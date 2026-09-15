@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RedditMD Lite</title>
+  <meta name="description" content="Minimal single-file Reddit thread to markdown exporter (backup)." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>R</text></svg>" />
+  <style>
+    :root { color-scheme: dark; --bg:#12110f; --panel:#1c1a17; --ink:#f3efe7; --muted:#b4aa99; --line:#3a342c; --accent:#ff4500; --ok:#9ad07a; --bad:#f0a0a0; --mono:ui-monospace,Menlo,Consolas,monospace; --sans:"Iowan Old Style",Palatino,Georgia,serif; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.45 var(--sans); }
+    .wrap { max-width:52rem; margin:0 auto; padding:2.25rem 1.25rem 4rem; }
+    h1 { margin:0 0 .35rem; font-size:2rem; letter-spacing:-.03em; }
+    p.sub, .hint, footer { color:var(--muted); }
+    label span { display:block; font-size:.92rem; margin:1.2rem 0 .4rem; }
+    input, textarea { width:100%; border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:8px; padding:.7rem .8rem; font:15px/1.4 var(--mono); }
+    .row { display:flex; gap:.5rem; flex-wrap:wrap; margin:1rem 0; align-items:center; }
+    button, a.btn { appearance:none; border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:8px; padding:.55rem .9rem; font:15px/1.2 var(--sans); text-decoration:none; cursor:pointer; }
+    button.primary { background:var(--accent); border-color:#d63a00; color:#fff; font-weight:650; }
+    button:disabled, a.btn[aria-disabled="true"] { opacity:.45; pointer-events:none; }
+    fieldset { border:1px solid var(--line); border-radius:6px; margin:0; padding:.4rem .7rem .6rem; }
+    legend { color:var(--muted); }
+    .status { min-height:1.3em; color:var(--muted); }
+    .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
+    pre { white-space:pre-wrap; word-break:break-word; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:1rem; font:13px/1.45 var(--mono); max-height:70vh; overflow:auto; }
+    footer { margin-top:2.5rem; font-size:.9rem; }
+    a { color:#ffb087; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>RedditMD Lite</h1>
+    <p class="sub">Single-file backup exporter. Paste a Reddit post URL, get compact markdown. Reads the public Arctic Shift archive (no proxy, no keys).</p>
+
+    <label><span>Reddit post URL</span>
+      <input id="url" type="url" placeholder="https://www.reddit.com/r/…/comments/…" autocomplete="off" />
+    </label>
+
+    <fieldset>
+      <legend>Sort</legend>
+      <label style="display:inline"><input type="radio" name="sort" value="score" checked /> Score</label>
+      <label style="display:inline"><input type="radio" name="sort" value="new" /> Newest</label>
+      <label style="display:inline"><input type="radio" name="sort" value="old" /> Oldest</label>
+    </fieldset>
+
+    <div class="row">
+      <button id="go" class="primary" type="button">Export</button>
+      <button id="copy" type="button" disabled>Copy</button>
+      <a id="dl" class="btn" aria-disabled="true">Download .md</a>
+    </div>
+
+    <p id="status" class="status"></p>
+    <pre id="out" hidden></pre>
+
+    <footer>
+      <p>Backup for <a href="./index.html">RedditMD</a> (the full version). Data via <a href="https://arctic-shift.photon-reddit.com">Arctic Shift</a>.</p>
+    </footer>
+  </div>
+
+  <script>
+  var ARCTIC = "https://arctic-shift.photon-reddit.com/api";
+  var $ = function (id) { return document.getElementById(id); };
+
+  function setStatus(m, k) { var s = $("status"); s.textContent = m || ""; s.className = "status " + (k || ""); }
+
+  function parseId(input) {
+    var v = (input || "").trim();
+    if (/^[a-z0-9]{4,10}$/i.test(v)) return v.toLowerCase();
+    try {
+      if (!/^https?:\/\//i.test(v)) v = "https://" + v;
+      var u = new URL(v);
+      if (u.hostname.replace(/^www\./, "") === "redd.it") return u.pathname.replace(/\//g, "").toLowerCase() || null;
+      var parts = u.pathname.split("/").filter(Boolean);
+      var at = parts.indexOf("comments");
+      if (at >= 0 && parts[at + 1]) return parts[at + 1].toLowerCase();
+    } catch (e) {}
+    return null;
+  }
+
+  async function getJson(url) {
+    var res = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }
+
+  function childrenOf(node) {
+    var r = node && node.data && node.data.replies;
+    if (!r || typeof r === "string") return [];
+    return (r.data && r.data.children) || [];
+  }
+
+  function sortNodes(nodes, sort) {
+    nodes.sort(function (a, b) {
+      var sa = Number((a.data && (a.data.score != null ? a.data.score : a.data.ups)) || 0);
+      var sb = Number((b.data && (b.data.score != null ? b.data.score : b.data.ups)) || 0);
+      var ca = Number((a.data && a.data.created_utc) || 0), cb = Number((b.data && b.data.created_utc) || 0);
+      if (sort === "new") return cb - ca;
+      if (sort === "old") return ca - cb;
+      return sb - sa || ca - cb;
+    });
+    for (var i = 0; i < nodes.length; i++) sortNodes(childrenOf(nodes[i]), sort);
+  }
+
+  function fmt(utc) { if (!utc) return ""; var d = new Date(utc * 1000); return isNaN(d) ? "" : d.toISOString().slice(0, 16).replace("T", " ") + " UTC"; }
+
+  function write(lines, nodes, depth, op) {
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      if (node.kind === "more") continue;
+      var c = node.data || {};
+      if (!c.body || c.body === "[deleted]" || c.body === "[removed]") { write(lines, childrenOf(node), depth, op); continue; }
+      var pad = new Array(depth + 1).join("  ");
+      var meta = ["u/" + (c.author || "[deleted]"), c.author && c.author === op ? "OP" : "", c.score != null ? "[" + c.score + "]" : ""].filter(Boolean).join(" ");
+      lines.push(pad + meta);
+      var body = String(c.body).replace(/\r\n/g, "\n").trim().split("\n");
+      for (var b = 0; b < body.length; b++) lines.push(pad + body[b]);
+      write(lines, childrenOf(node), depth + 1, op);
+      if (depth === 0) lines.push("");
+    }
+  }
+
+  function render(post, tree, sort) {
+    sortNodes(tree, sort);
+    var lines = [];
+    lines.push("# " + (post.title || "(untitled)"));
+    lines.push("");
+    lines.push([post.subreddit ? "r/" + post.subreddit : "", post.author ? "u/" + post.author : "", fmt(post.created_utc), post.score != null ? "score " + post.score : ""].filter(Boolean).join(" · "));
+    lines.push("https://www.reddit.com" + (post.permalink || "/comments/" + post.id));
+    lines.push("");
+    if (post.selftext) { lines.push(String(post.selftext).trim()); lines.push(""); }
+    lines.push("---");
+    lines.push("");
+    write(lines, tree, 0, post.author);
+    return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+  }
+
+  async function run() {
+    var id = parseId($("url").value);
+    if (!id) { setStatus("That does not look like a Reddit post URL.", "bad"); return; }
+    $("go").disabled = true;
+    setStatus("Fetching…");
+    try {
+      var postRes = await getJson(ARCTIC + "/posts/ids?ids=" + encodeURIComponent(id));
+      var post = postRes && postRes.data && postRes.data[0];
+      if (!post) throw new Error("Not in the archive yet — try the full version or a .json paste.");
+      var treeRes = await getJson(ARCTIC + "/comments/tree?link_id=" + encodeURIComponent(id) + "&limit=25000&start_breadth=100&start_depth=40");
+      var tree = (treeRes && treeRes.data) || [];
+      var sort = (document.querySelector('input[name="sort"]:checked') || {}).value || "score";
+      var md = render(post, tree, sort);
+      $("out").textContent = md;
+      $("out").hidden = false;
+      var blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+      var a = $("dl");
+      a.href = URL.createObjectURL(blob);
+      a.download = "r-" + (post.subreddit || "reddit") + "-" + id + ".md";
+      a.removeAttribute("aria-disabled");
+      $("copy").disabled = false;
+      var n = 0; (function count(x){ for (var i=0;i<x.length;i++){ if (x[i].kind!=="more"){ n++; count(childrenOf(x[i])); } } })(tree);
+      setStatus("Exported " + n + " comments.", "ok");
+    } catch (e) {
+      setStatus(e.message || String(e), "bad");
+    } finally {
+      $("go").disabled = false;
+    }
+  }
+
+  $("go").addEventListener("click", run);
+  $("url").addEventListener("keydown", function (e) { if (e.key === "Enter") run(); });
+  $("copy").addEventListener("click", function () { navigator.clipboard.writeText($("out").textContent).then(function () { setStatus("Copied.", "ok"); }); });
+  var pre = new URLSearchParams(location.search).get("url");
+  if (pre) { $("url").value = pre; run(); }
+  </script>
+</body>
+</html>

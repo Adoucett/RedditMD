@@ -37,6 +37,88 @@ html, body {
   color: var(--muted);
 }
 
+.tabs {
+  display: flex;
+  gap: 0.4rem;
+  margin: 1.2rem 0 0.2rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  font: 15px/1.2 var(--sans);
+}
+
+.tab.active {
+  background: var(--panel);
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.field-row {
+  display: flex;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.field.grow { flex: 1 1 16rem; }
+.field.narrow { flex: 0 0 12rem; }
+
+.presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.9rem 0 0.2rem;
+}
+
+.presets-label { color: var(--muted); font-size: 0.9rem; margin-right: 0.2rem; }
+
+.chip {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem;
+  font: 13px/1.2 var(--sans);
+  cursor: pointer;
+}
+
+.chip:hover { border-color: var(--accent); }
+
+.progress {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  overflow: hidden;
+  margin: 0.6rem 0 0.2rem;
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.progress-bar.indeterminate {
+  width: 35%;
+  animation: slide 1.1s ease-in-out infinite;
+}
+
+@keyframes slide {
+  0% { margin-left: -35%; }
+  100% { margin-left: 100%; }
+}
+
 .field {
   display: grid;
   gap: 0.4rem;
@@ -45,7 +127,7 @@ html, body {
 
 .field span { font-size: 0.92rem; }
 
-input[type="url"], textarea {
+input[type="url"], input[type="number"], textarea {
   width: 100%;
   border: 1px solid var(--line);
   background: var(--panel);
@@ -54,6 +136,21 @@ input[type="url"], textarea {
   padding: 0.7rem 0.8rem;
   font: 15px/1.4 var(--mono);
 }
+
+.num-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.65rem;
+}
+
+.num-grid label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.num-grid input { padding: 0.45rem 0.55rem; }
 
 textarea { resize: vertical; }
 

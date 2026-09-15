@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>RedditMD</title>
-  <meta name="description" content="Export a Reddit thread to compact markdown for AI analysis." />
+  <meta name="description" content="Export Reddit threads to compact markdown for AI analysis." />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>R</text></svg>" />
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -12,20 +12,60 @@
   <main class="wrap">
     <header class="hero">
       <h1>RedditMD</h1>
-      <p>Paste a Reddit post URL. Get the thread as compact markdown you can feed to an AI.</p>
+      <p>Turn a Reddit thread — or a whole subreddit's latest posts — into compact markdown you can feed to an AI.</p>
     </header>
 
-    <label class="field">
-      <span>Reddit post URL</span>
-      <input id="url" type="url" inputmode="url" placeholder="https://www.reddit.com/r/…/comments/…" autocomplete="off" />
-    </label>
+    <div class="tabs" role="tablist">
+      <button class="tab active" id="tabSingle" role="tab" type="button">Single thread</button>
+      <button class="tab" id="tabBulk" role="tab" type="button">Bulk subreddit</button>
+    </div>
 
-    <details class="opts">
+    <section id="singlePane">
+      <label class="field">
+        <span>Reddit post URL</span>
+        <input id="url" type="url" inputmode="url" placeholder="https://www.reddit.com/r/…/comments/…" autocomplete="off" />
+      </label>
+    </section>
+
+    <section id="bulkPane" hidden>
+      <div class="field-row">
+        <label class="field grow">
+          <span>Subreddit</span>
+          <input id="subreddit" type="text" placeholder="r/AskReddit or just AskReddit" autocomplete="off" />
+        </label>
+        <label class="field narrow">
+          <span>How many latest posts</span>
+          <input id="bulkCount" type="number" min="1" max="500" value="10" />
+        </label>
+      </div>
+      <p class="hint">Pulls the newest posts and every comment thread. Large counts make big files — best run on desktop. Download as one combined <code>.md</code> or a <code>.zip</code> of per-post files.</p>
+    </section>
+
+    <div class="presets" id="presets">
+      <span class="presets-label">Presets:</span>
+      <button type="button" data-preset="ai" class="chip">Compact for AI</button>
+      <button type="button" data-preset="full" class="chip">Full archive</button>
+      <button type="button" data-preset="pulse" class="chip">Top-level pulse</button>
+      <button type="button" data-preset="highlights" class="chip">Highlights (score ≥ 5)</button>
+    </div>
+
+    <details class="opts" id="optsPanel">
       <summary>Options</summary>
       <div class="opt-grid">
-        <label><input type="checkbox" id="loadAll" checked /> Pull remaining comments if the first pass is truncated</label>
+        <div class="num-grid">
+          <label>Min score <input id="minScore" type="number" value="0" step="1" /></label>
+          <label>Max comments <input id="maxComments" type="number" min="1" placeholder="all" /></label>
+          <label>Max depth <input id="maxDepth" type="number" min="0" placeholder="all" /></label>
+        </div>
+        <label><input type="checkbox" id="topLevelOnly" /> Top-level comments only</label>
         <label><input type="checkbox" id="includeDeleted" /> Keep deleted / removed comments</label>
-        <label><input type="checkbox" id="spaceTop" /> Blank line between top-level comments</label>
+        <label><input type="checkbox" id="spaceTop" checked /> Blank line between top-level comments</label>
+        <label><input type="checkbox" id="timestamps" /> Include timestamps</label>
+        <label><input type="checkbox" id="commentLinks" /> Include comment permalinks</label>
+        <label><input type="checkbox" id="markOp" checked /> Mark OP comments</label>
+        <label><input type="checkbox" id="stripMedia" checked /> Strip images / gifs</label>
+        <label><input type="checkbox" id="threadStats" checked /> Add a short thread summary for the AI</label>
+        <label><input type="checkbox" id="loadAll" checked /> Pull remaining / collapsed comments</label>
         <fieldset>
           <legend>Layout</legend>
           <label><input type="radio" name="style" value="compact" checked /> Compact (best for AI)</label>
@@ -38,15 +78,20 @@
           <label><input type="radio" name="sort" value="new" /> Newest</label>
           <label><input type="radio" name="sort" value="old" /> Oldest</label>
         </fieldset>
+        <p class="hint">After a thread loads, changing filters reformats instantly. "Pull remaining / collapsed comments" needs a fresh export.</p>
       </div>
     </details>
 
     <div class="actions">
       <button id="exportBtn" class="primary" type="button">Export thread</button>
+      <button id="cancelBtn" type="button" hidden>Cancel</button>
       <button id="copyBtn" type="button" disabled>Copy</button>
       <a id="downloadBtn" class="btn" aria-disabled="true">Download .md</a>
+      <a id="jsonBtnDl" class="btn" aria-disabled="true">Download .json</a>
+      <a id="zipBtn" class="btn" aria-disabled="true" hidden>Download .zip</a>
     </div>
 
+    <div id="progress" class="progress" hidden><div id="progressBar" class="progress-bar"></div></div>
     <p id="status" class="status" hidden></p>
     <p id="stats" class="stats" hidden></p>
 
@@ -59,13 +104,15 @@
 
     <section id="outputBlock" hidden>
       <h2>Markdown</h2>
+      <p id="previewNote" class="hint" hidden></p>
       <pre id="output"></pre>
     </section>
 
     <footer>
-      <p>Static GitHub Pages tool. Reads public Reddit archives via Arctic Shift, with PullPush as backup. Inspired by <a href="https://github.com/farnots/RedditToMarkdown">farnots/RedditToMarkdown</a>.</p>
+      <p>Static GitHub Pages tool. Reads public Reddit archives via <a href="https://arctic-shift.photon-reddit.com">Arctic Shift</a>, with <a href="https://pullpush.io">PullPush</a> as backup. Inspired by <a href="https://github.com/farnots/RedditToMarkdown">farnots/RedditToMarkdown</a>.</p>
     </footer>
   </main>
+  <script src="./engine.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

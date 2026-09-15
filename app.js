@@ -1,534 +1,582 @@
-const ARCTIC = "https://arctic-shift.photon-reddit.com/api";
-const PULLPUSH = "https://api.pullpush.io/reddit";
+/* global RedditMD */
+(function () {
+  "use strict";
 
-const $ = (id) => document.getElementById(id);
+  var $ = function (id) {
+    return document.getElementById(id);
+  };
 
-const onReady = () => {
-  $("exportBtn").addEventListener("click", () => exportFromUrl());
-  $("jsonBtn").addEventListener("click", () => exportFromJson());
-  $("copyBtn").addEventListener("click", copyMarkdown);
-  $("url").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") exportFromUrl();
-  });
-  const preset = new URLSearchParams(location.search).get("url");
-  if (preset) {
-    $("url").value = preset;
-    exportFromUrl();
-  }
-};
+  var PREVIEW_LIMIT = 400000; // characters rendered into the <pre>; full text still downloads
+  var mode = "single";
+  var lastResult = null; // { md } for current single/bulk output
+  var objectUrls = [];
+  var reqId = 0;
 
-document.addEventListener("DOMContentLoaded", onReady);
+  /* ------------------------------------------------------------------ */
+  /* Backend: Web Worker when possible, main-thread engine otherwise     */
+  /* ------------------------------------------------------------------ */
 
-function setStatus(message, kind = "") {
-  const el = $("status");
-  el.hidden = !message;
-  el.className = `status ${kind}`;
-  el.textContent = message || "";
-}
-
-async function exportFromUrl() {
-  const raw = $("url").value.trim();
-  if (!raw) {
-    setStatus("Paste a Reddit post URL first.", "bad");
-    return;
-  }
-  setBusy(true);
-  setStatus("Looking up the thread…");
-  try {
-    const parsed = await resolvePost(raw);
-    const thread = await loadThread(parsed);
-    finish(thread, parsed);
-  } catch (err) {
-    console.error(err);
-    setStatus(err.message || String(err), "bad");
-  } finally {
-    setBusy(false);
-  }
-}
-
-function exportFromJson() {
-  const text = $("jsonInput").value.trim();
-  if (!text) {
-    setStatus("Paste Reddit JSON first.", "bad");
-    return;
-  }
-  try {
-    const data = JSON.parse(text);
-    const thread = threadFromRedditListing(data);
-    const parsed = parseRedditUrl($("url").value.trim()) || inferParsed(thread);
-    finish(thread, parsed);
-  } catch (err) {
-    setStatus(`JSON parse failed: ${err.message}`, "bad");
-  }
-}
-
-function finish(thread, parsed) {
-  sortTree(thread.comments, selectedSort());
-  const md = renderMarkdown(thread, selectedStyle());
-  $("output").textContent = md;
-  $("outputBlock").hidden = false;
-  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
-  const name = filenameFor(thread, parsed);
-  const dl = $("downloadBtn");
-  dl.href = URL.createObjectURL(blob);
-  dl.download = name;
-  dl.removeAttribute("aria-disabled");
-  $("copyBtn").disabled = false;
-  const stats = tally(thread);
-  $("stats").hidden = false;
-  $("stats").textContent = `${stats.comments} comments · ${stats.authors} authors · depth ${stats.depth} · source ${thread.source}`;
-  setStatus(`Exported ${stats.comments} comments.`, "ok");
-}
-
-function setBusy(busy) {
-  $("exportBtn").disabled = busy;
-  $("jsonBtn").disabled = busy;
-}
-
-function selectedStyle() {
-  return document.querySelector('input[name="style"]:checked')?.value || "compact";
-}
-
-function selectedSort() {
-  return document.querySelector('input[name="sort"]:checked')?.value || "score";
-}
-
-async function copyMarkdown() {
-  await navigator.clipboard.writeText($("output").textContent);
-  setStatus("Copied to clipboard.", "ok");
-}
-
-function filenameFor(thread, parsed) {
-  const sub = slug(thread.post.subreddit || parsed.subreddit || "reddit");
-  const id = thread.post.id || parsed.postId || "thread";
-  const title = slug(thread.post.title || "post").slice(0, 48);
-  return `r-${sub}-${id}-${title}.md`;
-}
-
-function slug(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "") || "post";
-}
-
-/* ---------- URL / ID ---------- */
-
-function parseRedditUrl(input) {
-  if (!input) return null;
-  let value = input.trim();
-  if (/^[a-z0-9]{5,8}$/i.test(value)) {
-    return { postId: value.toLowerCase(), commentId: null, subreddit: null, shortPath: null };
-  }
-  try {
-    if (!/^https?:\/\//i.test(value)) value = `https://${value}`;
-    const url = new URL(value);
-    const host = url.hostname.replace(/^www\./, "");
-    if (host === "redd.it") {
-      const id = url.pathname.replace(/\//g, "");
-      return id ? { postId: id, commentId: null, subreddit: null, shortPath: null } : null;
+  function makeBackend(onProgress) {
+    var worker = null;
+    try {
+      worker = new Worker("./reddit-worker.js");
+    } catch (e) {
+      worker = null;
     }
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (parts[0] === "r" && parts[2] === "s" && parts[3]) {
-      return { postId: null, commentId: null, subreddit: parts[1], shortPath: `/r/${parts[1]}/s/${parts[3]}` };
-    }
-    const commentsAt = parts.indexOf("comments");
-    if (commentsAt >= 0 && parts[commentsAt + 1]) {
+
+    if (worker) {
+      var pending = {};
+      worker.onmessage = function (e) {
+        var m = e.data || {};
+        if (m.type === "progress") {
+          onProgress(m.update);
+          return;
+        }
+        var p = pending[m.id];
+        if (!p) return;
+        if (m.type === "error") {
+          delete pending[m.id];
+          p.reject(Object.assign(new Error(m.message), { aborted: m.aborted }));
+        } else {
+          delete pending[m.id];
+          p.resolve(m);
+        }
+      };
+      worker.onerror = function () {
+        /* surfaced per-request via error messages */
+      };
+      var send = function (payload) {
+        return new Promise(function (resolve, reject) {
+          payload.id = ++reqId;
+          pending[payload.id] = { resolve: resolve, reject: reject };
+          worker.postMessage(payload);
+        });
+      };
       return {
-        postId: parts[commentsAt + 1],
-        commentId: parts[commentsAt + 3] || null,
-        subreddit: parts[0] === "r" ? parts[1] : null,
-        shortPath: null,
+        kind: "worker",
+        export: function (input, opts, refresh) {
+          return send({ type: "export", input: input, opts: opts, refresh: refresh });
+        },
+        reformat: function (opts) {
+          return send({ type: "reformat", opts: opts });
+        },
+        json: function (opts) {
+          return send({ type: "json", opts: opts }).then(function (m) {
+            return m.json;
+          });
+        },
+        bulk: function (input, count, opts) {
+          return send({ type: "bulk", input: input, count: count, opts: opts });
+        },
+        bulkZip: function (opts) {
+          return send({ type: "bulkZip", opts: opts }).then(function (m) {
+            return m.blob;
+          });
+        },
+        cancel: function () {
+          worker.postMessage({ type: "cancel" });
+        },
       };
     }
-  } catch {
-    return null;
+
+    return makeLocalBackend(onProgress);
   }
-  return null;
-}
 
-async function resolvePost(input) {
-  const parsed = parseRedditUrl(input);
-  if (!parsed) throw new Error("That does not look like a Reddit post URL.");
-  if (parsed.postId) return parsed;
-  if (parsed.shortPath) {
-    setStatus("Resolving short link…");
-    const res = await getJson(`${ARCTIC}/short_links?paths=${encodeURIComponent(parsed.shortPath)}`);
-    const dest = res?.data?.[parsed.shortPath] || res?.data?.[0] || res?.[parsed.shortPath];
-    const next = parseRedditUrl(typeof dest === "string" ? dest : dest?.url || dest?.permalink);
-    if (!next?.postId) throw new Error("Could not resolve that Reddit short link.");
-    return next;
-  }
-  throw new Error("Could not find a post ID in that URL.");
-}
-
-function inferParsed(thread) {
-  return {
-    postId: thread.post.id,
-    subreddit: thread.post.subreddit,
-    commentId: null,
-    shortPath: null,
-  };
-}
-
-/* ---------- Fetch ---------- */
-
-async function getJson(url) {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`${res.status} from ${url} ${text.slice(0, 160)}`);
-  }
-  return res.json();
-}
-
-async function loadThread(parsed) {
-  try {
-    setStatus("Fetching post + comment tree…");
-    return await loadFromArctic(parsed);
-  } catch (arcticErr) {
-    console.warn("Arctic Shift failed", arcticErr);
-    setStatus("Archive missed. Trying PullPush…");
-    try {
-      return await loadFromPullpush(parsed);
-    } catch (ppErr) {
-      console.warn("PullPush failed", ppErr);
-      throw new Error(
-        `Could not load that thread automatically (${arcticErr.message}). For brand-new posts, open the Reddit URL, add .json, and paste the JSON below.`
-      );
+  // Main-thread fallback (file:// or blocked workers). Same behavior, no isolation.
+  function makeLocalBackend(onProgress) {
+    var current = null;
+    var bulk = null;
+    var controller = null;
+    var ctx = function () {
+      controller = new AbortController();
+      return { signal: controller.signal, emit: onProgress };
+    };
+    var yield_ = function () {
+      return new Promise(function (r) {
+        setTimeout(r, 0);
+      });
+    };
+    function singleResult(opts) {
+      RedditMD.finalize(current.index, opts.sort);
+      var view = RedditMD.computeView(current.index, opts);
+      var md = RedditMD.renderMarkdown(current.index, current.post, opts, view);
+      return {
+        mode: "single",
+        md: md,
+        post: current.post,
+        filename: RedditMD.filenameFor(current.post, { postId: current.index.postId }),
+        stats: {
+          fetched: current.index.byId.size,
+          exported: view.shown,
+          authors: view.authors.size,
+          maxDepth: view.maxDepth,
+          unplaced: current.index.unresolved.length,
+          collapsed: current.index.moreIds.size,
+          source: current.index.source,
+          capped: view.capped,
+        },
+      };
     }
-  }
-}
-
-async function loadFromArctic(parsed) {
-  const postRes = await getJson(`${ARCTIC}/posts/ids?ids=${encodeURIComponent(parsed.postId)}`);
-  const post = postRes?.data?.[0];
-  if (!post) throw new Error("Arctic Shift does not have that post yet.");
-
-  let treeRes;
-  try {
-    treeRes = await getJson(
-      `${ARCTIC}/comments/tree?link_id=${encodeURIComponent(parsed.postId)}&limit=25000&start_breadth=80&start_depth=30`
-    );
-  } catch (err) {
-    console.warn("full tree failed, retrying smaller", err);
-    treeRes = await getJson(
-      `${ARCTIC}/comments/tree?link_id=${encodeURIComponent(parsed.postId)}&limit=2000&start_breadth=20&start_depth=12`
-    );
-  }
-  let comments = normalizeListing(treeRes?.data || []);
-  if ($("loadAll").checked) {
-    comments = await expandMore(parsed.postId, comments);
-    comments = await fillMissing(parsed.postId, comments, post.num_comments);
-  }
-  return { post, comments, source: "arctic-shift" };
-}
-
-async function expandMore(postId, comments) {
-  const ids = [];
-  walkComments(comments, (node) => {
-    if (node.kind === "more") {
-      for (const id of node.data?.children || []) ids.push(id);
-    }
-  });
-  const unique = [...new Set(ids)].filter(Boolean);
-  if (!unique.length) return stripMore(comments);
-
-  setStatus(`Pulling ${unique.length} extra comments…`);
-  const extras = [];
-  for (const chunk of chunked(unique, 100)) {
-    const res = await getJson(`${ARCTIC}/comments/ids?ids=${chunk.join(",")}`);
-    extras.push(...(res?.data || []));
-  }
-  return mergeFlatIntoTree(comments, extras, `t3_${postId}`);
-}
-
-async function fillMissing(postId, comments, expected) {
-  const have = countComments(comments);
-  if (!expected || have >= expected * 0.9 || have >= 20000) return comments;
-  setStatus(`Have ${have}/${expected}. Scanning remaining comments…`);
-  const extras = [];
-  let after = 0;
-  for (let i = 0; i < 30; i++) {
-    const url = `${ARCTIC}/comments/search?link_id=${encodeURIComponent(postId)}&limit=100&sort=asc${after ? `&after=${after}` : ""}`;
-    const res = await getJson(url);
-    const batch = res?.data || [];
-    if (!batch.length) break;
-    extras.push(...batch);
-    const last = batch[batch.length - 1]?.created_utc;
-    if (!last || batch.length < 100) break;
-    after = Number(last) + 1;
-  }
-  return mergeFlatIntoTree(comments, extras, `t3_${postId}`);
-}
-
-async function loadFromPullpush(parsed) {
-  const postRes = await getJson(`${PULLPUSH}/search/submission/?ids=${encodeURIComponent(parsed.postId)}`);
-  const post = postRes?.data?.[0];
-  if (!post) throw new Error("PullPush does not have that post.");
-  const extras = [];
-  let after = "";
-  for (let i = 0; i < 40; i++) {
-    const url = `${PULLPUSH}/search/comment/?link_id=${encodeURIComponent(parsed.postId)}&size=100&sort=asc&sort_type=created_utc${after ? `&after=${after}` : ""}`;
-    const res = await getJson(url);
-    const batch = res?.data || [];
-    if (!batch.length) break;
-    extras.push(...batch);
-    const last = batch[batch.length - 1]?.created_utc;
-    if (!last || String(last) === after || batch.length < 100) break;
-    after = String(last);
-  }
-  const comments = mergeFlatIntoTree([], extras, `t3_${parsed.postId}`);
-  return { post, comments, source: "pullpush" };
-}
-
-function threadFromRedditListing(data) {
-  if (!Array.isArray(data) || data.length < 2) {
-    throw new Error("Need the usual Reddit listing JSON: [post, comments].");
-  }
-  const post = data[0]?.data?.children?.[0]?.data;
-  const comments = normalizeListing(data[1]?.data?.children || []);
-  if (!post) throw new Error("No post object in that JSON.");
-  return { post, comments, source: "pasted-json" };
-}
-
-/* ---------- Tree helpers ---------- */
-
-function normalizeListing(nodes) {
-  return (nodes || []).map((node) => {
-    if (node?.kind && node.data) {
-      const copy = { kind: node.kind, data: { ...node.data } };
-      copy.data.replies = kidsToListing(copy.data.replies);
-      return copy;
-    }
-    const data = { ...node };
-    data.replies = kidsToListing(data.replies);
-    return { kind: node.kind || (node.body != null ? "t1" : "more"), data };
-  });
-}
-
-function kidsToListing(replies) {
-  if (!replies) return "";
-  if (typeof replies === "string") return replies;
-  if (Array.isArray(replies)) {
-    return { kind: "Listing", data: { children: normalizeListing(replies) } };
-  }
-  if (replies.kind === "Listing") {
-    return { kind: "Listing", data: { children: normalizeListing(replies.data?.children || []) } };
-  }
-  return replies;
-}
-
-function childrenOf(node) {
-  const replies = node?.data?.replies;
-  if (!replies || typeof replies === "string") return [];
-  return replies.data?.children || [];
-}
-
-function setChildren(node, kids) {
-  node.data.replies = kids.length
-    ? { kind: "Listing", data: { children: kids } }
-    : "";
-}
-
-function stripMore(nodes) {
-  return (nodes || [])
-    .filter((n) => n.kind !== "more")
-    .map((n) => {
-      setChildren(n, stripMore(childrenOf(n)));
-      return n;
-    });
-}
-
-function walkComments(nodes, visit) {
-  for (const node of nodes || []) {
-    visit(node);
-    walkComments(childrenOf(node), visit);
-  }
-}
-
-function countComments(nodes) {
-  let n = 0;
-  walkComments(nodes, (node) => {
-    if (node.kind !== "more" && node.data?.body != null) n += 1;
-  });
-  return n;
-}
-
-function existingIds(nodes) {
-  const ids = new Set();
-  walkComments(nodes, (node) => {
-    if (node.data?.id) ids.add(node.data.id);
-  });
-  return ids;
-}
-
-function mergeFlatIntoTree(tree, flats, rootName) {
-  const nodes = new Map();
-  const collect = (list) => {
-    for (const node of list || []) {
-      if (node.kind === "more") continue;
-      const id = node.data?.id;
-      if (id) nodes.set(id, node);
-      collect(childrenOf(node));
-    }
-  };
-  collect(tree);
-
-  for (const raw of flats || []) {
-    const data = raw.data || raw;
-    if (!data.id || nodes.has(data.id)) continue;
-    nodes.set(data.id, { kind: "t1", data: { ...data, replies: "" } });
+    return {
+      kind: "local",
+      export: async function (input, opts) {
+        var c = ctx();
+        var parsed = await RedditMD.resolvePost(input, c);
+        current = await RedditMD.acquire(parsed, opts, c);
+        await yield_();
+        return singleResult(opts);
+      },
+      reformat: async function (opts) {
+        if (!current) return null;
+        await yield_();
+        return singleResult(opts);
+      },
+      json: async function (opts) {
+        if (!current) return "";
+        RedditMD.finalize(current.index, opts.sort);
+        return JSON.stringify(RedditMD.buildJson(current.index, current.post, opts), null, 2);
+      },
+      bulk: async function (input, count, opts) {
+        var c = ctx();
+        var sub = RedditMD.parseSubredditInput(input);
+        if (!sub) throw new Error("That does not look like a subreddit.");
+        bulk = await RedditMD.acquireSubreddit(sub, count, opts, c);
+        var md = RedditMD.renderBulkMarkdown(bulk.threads, opts);
+        var total = 0;
+        bulk.threads.forEach(function (t) {
+          total += t.index.byId.size;
+        });
+        return {
+          mode: "bulk",
+          subreddit: sub,
+          md: md,
+          posts: bulk.threads.length,
+          comments: total,
+          titles: bulk.threads.map(function (t) {
+            return { id: t.post.id, title: t.post.title, comments: t.index.byId.size, error: t.index.error || null };
+          }),
+        };
+      },
+      bulkZip: async function (opts) {
+        if (!bulk) return null;
+        var files = bulk.threads.map(function (t) {
+          RedditMD.finalize(t.index, opts.sort);
+          return {
+            name: RedditMD.filenameFor(t.post, { postId: t.post.id }) + ".md",
+            data: RedditMD.renderMarkdown(t.index, t.post, opts),
+          };
+        });
+        return RedditMD.makeZipBlob(files);
+      },
+      cancel: function () {
+        if (controller) controller.abort();
+      },
+    };
   }
 
-  const roots = [];
-  const pending = new Map();
-  const addUnder = (parentId, node) => {
-    if (!pending.has(parentId)) pending.set(parentId, []);
-    pending.get(parentId).push(node);
-  };
+  var backend = null;
 
-  for (const node of nodes.values()) {
-    const parent = node.data.parent_id || rootName;
-    if (!parent || parent === rootName) roots.push(node);
-    else addUnder(parent.replace(/^t1_/, ""), node);
+  /* ------------------------------------------------------------------ */
+  /* UI plumbing                                                         */
+  /* ------------------------------------------------------------------ */
+
+  function setStatus(message, kind) {
+    var el = $("status");
+    el.hidden = !message;
+    el.className = "status " + (kind || "");
+    el.textContent = message || "";
   }
 
-  for (const node of nodes.values()) {
-    const extras = pending.get(node.data.id) || [];
-    const kids = [...childrenOf(node), ...extras.filter((e) => !childrenOf(node).some((k) => k.data?.id === e.data?.id))];
-    setChildren(node, kids);
-  }
-
-  const used = new Set();
-  walkComments(roots, (n) => used.add(n.data?.id));
-  for (const node of nodes.values()) {
-    if (!used.has(node.data?.id)) roots.push(node);
-  }
-  return stripMore(roots);
-}
-
-function chunked(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-
-function sortTree(nodes, sort) {
-  const score = (n) => Number(n.data?.score ?? n.data?.ups ?? 0);
-  const created = (n) => Number(n.data?.created_utc || 0);
-  nodes.sort((a, b) => {
-    if (sort === "new") return created(b) - created(a);
-    if (sort === "old") return created(a) - created(b);
-    return score(b) - score(a);
-  });
-  for (const node of nodes) sortTree(childrenOf(node), sort);
-}
-
-/* ---------- Markdown ---------- */
-
-function renderMarkdown(thread, style) {
-  const post = thread.post;
-  const lines = [];
-  const when = fmtTime(post.created_utc);
-  const permalink = post.permalink
-    ? `https://www.reddit.com${post.permalink}`
-    : `https://www.reddit.com/comments/${post.id}`;
-  lines.push(`# ${post.title || "(untitled)"}`);
-  lines.push("");
-  lines.push(
-    [
-      post.subreddit ? `r/${post.subreddit}` : null,
-      post.author ? `u/${post.author}` : null,
-      when,
-      Number.isFinite(Number(post.score)) ? `score ${post.score}` : null,
-      post.upvote_ratio != null ? `${Math.round(post.upvote_ratio * 100)}% upvoted` : null,
-      post.num_comments != null ? `${post.num_comments} comments listed` : null,
-      post.link_flair_text ? `flair: ${post.link_flair_text}` : null,
-    ]
-      .filter(Boolean)
-      .join(" · ")
-  );
-  lines.push(permalink);
-  if (post.url && !post.is_self && post.url !== permalink) lines.push(post.url);
-  lines.push("");
-  if (post.selftext) {
-    lines.push(post.selftext.trim());
-    lines.push("");
-  }
-  lines.push("---");
-  lines.push("");
-  const includeDeleted = $("includeDeleted").checked;
-  const spaceTop = $("spaceTop").checked;
-  writeComments(lines, thread.comments, 0, style, includeDeleted, spaceTop);
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
-}
-
-function writeComments(lines, nodes, depth, style, includeDeleted, spaceTop) {
-  for (const node of nodes || []) {
-    if (node.kind === "more") continue;
-    const c = node.data || {};
-    const deleted = !c.body || c.body === "[deleted]" || c.body === "[removed]";
-    if (deleted && !includeDeleted) {
-      writeComments(lines, childrenOf(node), depth, style, includeDeleted, spaceTop);
-      continue;
-    }
-    const author = c.author ? `u/${c.author}` : "u/[deleted]";
-    const meta = [
-      author,
-      c.score != null ? `[${c.score}]` : null,
-      c.distinguished ? c.distinguished : null,
-      c.stickied ? "stickied" : null,
-    ]
-      .filter(Boolean)
-      .join(" ");
-    const body = formatBody(c.body || "[deleted]");
-    if (style === "tree") {
-      const pad = depth === 0 ? "##### " : `├${"─".repeat(depth)} `;
-      lines.push(`${pad}${oneLine(body)} — ${meta}`);
-    } else if (style === "list") {
-      const pad = `${"  ".repeat(depth)}- `;
-      const indented = body.split("\n").map((ln, i) => (i === 0 ? `${pad}${ln}` : `${"  ".repeat(depth)}  ${ln}`));
-      lines.push(indented.join("\n"));
-      lines.push(`${"  ".repeat(depth)}  — ${meta}`);
+  function showProgress(update) {
+    var bar = $("progressBar");
+    var wrap = $("progress");
+    wrap.hidden = false;
+    if (update && update.total) {
+      var pct = Math.min(100, Math.round(((update.index + 1) / update.total) * 100));
+      bar.style.width = pct + "%";
+      bar.classList.remove("indeterminate");
     } else {
-      const pad = "  ".repeat(depth);
-      lines.push(`${pad}${meta}`);
-      for (const ln of body.split("\n")) lines.push(pad + ln);
+      bar.classList.add("indeterminate");
     }
-    writeComments(lines, childrenOf(node), depth + 1, style, includeDeleted, spaceTop);
-    if (depth === 0 && spaceTop) lines.push("");
+    var msg = update && update.message ? update.message : "Working…";
+    if (update && update.loaded != null) {
+      msg += " (" + update.loaded + " loaded" + (update.collapsed ? ", " + update.collapsed + " collapsed" : "") + ")";
+    }
+    setStatus(msg);
   }
-}
 
-function formatBody(text) {
-  return String(text).replace(/\r\n/g, "\n").replace(/[ \t]+\n/g, "\n").trim();
-}
+  function hideProgress() {
+    $("progress").hidden = true;
+    $("progressBar").classList.remove("indeterminate");
+    $("progressBar").style.width = "0%";
+  }
 
-function oneLine(text) {
-  return formatBody(text).replace(/\n+/g, " / ");
-}
+  function setBusy(busy) {
+    $("exportBtn").disabled = busy;
+    $("jsonBtn").disabled = busy;
+    $("cancelBtn").hidden = !busy;
+    document.querySelectorAll(".chip").forEach(function (b) {
+      b.disabled = busy;
+    });
+  }
 
-function fmtTime(utc) {
-  if (!utc) return null;
-  const d = new Date(Number(utc) * 1000);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 16).replace("T", " ") + " UTC";
-}
+  function clearObjectUrls() {
+    objectUrls.forEach(function (u) {
+      URL.revokeObjectURL(u);
+    });
+    objectUrls = [];
+  }
 
-function tally(thread) {
-  let comments = 0;
-  let depth = 0;
-  const authors = new Set();
-  const walk = (nodes, d) => {
-    depth = Math.max(depth, d);
-    for (const node of nodes || []) {
-      if (node.kind === "more") continue;
-      comments += 1;
-      if (node.data?.author) authors.add(node.data.author);
-      walk(childrenOf(node), d + 1);
+  function armDownload(id, blob, name) {
+    var el = $(id);
+    var url = URL.createObjectURL(blob);
+    objectUrls.push(url);
+    el.href = url;
+    el.download = name;
+    el.removeAttribute("aria-disabled");
+    el.hidden = false;
+  }
+
+  function numOr(value, fallback) {
+    if (String(value).trim() === "") return fallback;
+    var n = Number(value);
+    return isFinite(n) ? n : fallback;
+  }
+
+  function readOptions() {
+    return {
+      includeDeleted: $("includeDeleted").checked,
+      spaceTop: $("spaceTop").checked,
+      timestamps: $("timestamps").checked,
+      commentLinks: $("commentLinks").checked,
+      markOp: $("markOp").checked,
+      stripMedia: $("stripMedia").checked,
+      threadStats: $("threadStats").checked,
+      topLevelOnly: $("topLevelOnly").checked,
+      loadAll: $("loadAll").checked,
+      minScore: numOr($("minScore").value, 0),
+      maxComments: numOr($("maxComments").value, null),
+      maxDepth: numOr($("maxDepth").value, null),
+      style: (document.querySelector('input[name="style"]:checked') || {}).value || "compact",
+      sort: (document.querySelector('input[name="sort"]:checked') || {}).value || "score",
+    };
+  }
+
+  function renderPreview(md) {
+    var note = $("previewNote");
+    if (md.length > PREVIEW_LIMIT) {
+      $("output").textContent = md.slice(0, PREVIEW_LIMIT) + "\n\n… preview truncated — use Download for the full file.";
+      note.hidden = false;
+      note.textContent = "Preview shows the first " + Math.round(PREVIEW_LIMIT / 1000) + "k characters. The download contains everything.";
+    } else {
+      $("output").textContent = md;
+      note.hidden = true;
     }
+    $("outputBlock").hidden = false;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Actions                                                             */
+  /* ------------------------------------------------------------------ */
+
+  async function runExport(refresh) {
+    var opts = readOptions();
+    if (mode === "bulk") return runBulk(opts);
+    var input = $("url").value.trim();
+    if (!input) {
+      setStatus("Paste a Reddit post URL first.", "bad");
+      return;
+    }
+    setBusy(true);
+    clearObjectUrls();
+    setStatus("Looking up the thread…");
+    try {
+      var result = await backend.export(input, opts, refresh);
+      lastResult = result;
+      renderPreview(result.md);
+      armDownload("downloadBtn", new Blob([result.md], { type: "text/markdown;charset=utf-8" }), result.filename + ".md");
+      $("jsonBtnDl").removeAttribute("aria-disabled");
+      $("zipBtn").hidden = true;
+      $("copyBtn").disabled = false;
+      showStats(result.stats);
+    } catch (err) {
+      if (err && err.aborted) setStatus("Cancelled.", "");
+      else setStatus(err.message || String(err), "bad");
+    } finally {
+      setBusy(false);
+      hideProgress();
+    }
+  }
+
+  async function runBulk(opts) {
+    var input = $("subreddit").value.trim();
+    var count = numOr($("bulkCount").value, 10);
+    if (!input) {
+      setStatus("Enter a subreddit first.", "bad");
+      return;
+    }
+    setBusy(true);
+    clearObjectUrls();
+    setStatus("Listing posts…");
+    try {
+      var result = await backend.bulk(input, count, opts);
+      lastResult = result;
+      renderPreview(result.md);
+      armDownload("downloadBtn", new Blob([result.md], { type: "text/markdown;charset=utf-8" }), "r-" + result.subreddit + "-latest-" + result.posts + ".md");
+      $("jsonBtnDl").setAttribute("aria-disabled", "true");
+      $("zipBtn").hidden = false;
+      $("zipBtn").setAttribute("aria-disabled", "true");
+      $("copyBtn").disabled = false;
+      var errs = result.titles.filter(function (t) {
+        return t.error;
+      }).length;
+      $("stats").hidden = false;
+      $("stats").textContent =
+        result.posts + " posts · " + result.comments + " comments" + (errs ? " · " + errs + " failed" : "");
+      setStatus("Pulled " + result.posts + " posts from r/" + result.subreddit + ".", "ok");
+      // Pre-arm the zip lazily on click
+    } catch (err) {
+      if (err && err.aborted) setStatus("Cancelled.", "");
+      else setStatus(err.message || String(err), "bad");
+    } finally {
+      setBusy(false);
+      hideProgress();
+    }
+  }
+
+  function showStats(s) {
+    $("stats").hidden = false;
+    var parts = [
+      s.exported + " shown",
+      s.fetched + " fetched",
+      s.authors + " authors",
+      "depth " + s.maxDepth,
+    ];
+    if (s.unplaced) parts.push(s.unplaced + " unplaced");
+    if (s.collapsed) parts.push(s.collapsed + " still collapsed");
+    parts.push(s.source);
+    $("stats").textContent = parts.join(" · ");
+    var warn = s.collapsed || s.unplaced;
+    setStatus(
+      "Exported " + s.exported + " of " + s.fetched + " fetched comments." + (warn ? " Some comments could not be fully resolved (see summary)." : ""),
+      warn ? "" : "ok"
+    );
+  }
+
+  var reformatTimer = null;
+  function scheduleReformat() {
+    if (!lastResult || mode !== "single") return;
+    clearTimeout(reformatTimer);
+    reformatTimer = setTimeout(async function () {
+      var opts = readOptions();
+      try {
+        var result = await backend.reformat(opts);
+        if (!result) return;
+        lastResult = result;
+        clearObjectUrls();
+        renderPreview(result.md);
+        armDownload("downloadBtn", new Blob([result.md], { type: "text/markdown;charset=utf-8" }), result.filename + ".md");
+        $("jsonBtnDl").removeAttribute("aria-disabled");
+        showStats(result.stats);
+      } catch (err) {
+        setStatus(err.message || String(err), "bad");
+      }
+    }, 180);
+  }
+
+  async function downloadJson() {
+    if (!lastResult || mode !== "single") return;
+    setStatus("Building JSON…");
+    try {
+      var json = await backend.json(readOptions());
+      var blob = new Blob([json], { type: "application/json" });
+      triggerDownload(blob, (lastResult.filename || "thread") + ".json");
+      setStatus("JSON ready.", "ok");
+    } catch (err) {
+      setStatus(err.message || String(err), "bad");
+    }
+  }
+
+  async function downloadZip() {
+    if (mode !== "bulk" || !lastResult) return;
+    setStatus("Zipping per-post files…");
+    try {
+      var blob = await backend.bulkZip(readOptions());
+      triggerDownload(blob, "r-" + lastResult.subreddit + "-latest-" + lastResult.posts + ".zip");
+      setStatus("ZIP ready.", "ok");
+    } catch (err) {
+      setStatus(err.message || String(err), "bad");
+    }
+  }
+
+  function triggerDownload(blob, name) {
+    var url = URL.createObjectURL(blob);
+    objectUrls.push(url);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function exportFromJson() {
+    var text = $("jsonInput").value.trim();
+    if (!text) {
+      setStatus("Paste Reddit JSON first.", "bad");
+      return;
+    }
+    if (text.length > 60000000) {
+      setStatus("That JSON is very large — try a smaller thread.", "bad");
+      return;
+    }
+    var opts = readOptions();
+    try {
+      var data = JSON.parse(text);
+      var built = RedditMD.indexFromRedditListing(data);
+      RedditMD.finalize(built.index, opts.sort);
+      var view = RedditMD.computeView(built.index, opts);
+      var md = RedditMD.renderMarkdown(built.index, built.post, opts, view);
+      lastResult = { md: md, filename: RedditMD.filenameFor(built.post, { postId: built.index.postId }), local: built };
+      mode = "single";
+      clearObjectUrls();
+      renderPreview(md);
+      armDownload("downloadBtn", new Blob([md], { type: "text/markdown;charset=utf-8" }), lastResult.filename + ".md");
+      $("copyBtn").disabled = false;
+      showStats({
+        exported: view.shown,
+        fetched: built.index.byId.size,
+        authors: view.authors.size,
+        maxDepth: view.maxDepth,
+        unplaced: built.index.unresolved.length,
+        collapsed: built.index.moreIds.size,
+        source: "pasted-json",
+      });
+    } catch (err) {
+      setStatus("JSON parse failed: " + (err.message || err), "bad");
+    }
+  }
+
+  async function copyOutput() {
+    try {
+      var text = lastResult ? lastResult.md : $("output").textContent;
+      await navigator.clipboard.writeText(text);
+      setStatus("Copied to clipboard.", "ok");
+    } catch (err) {
+      setStatus("Copy failed — use Download instead.", "bad");
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Presets + mode                                                      */
+  /* ------------------------------------------------------------------ */
+
+  var PRESETS = {
+    ai: { style: "compact", minScore: "", maxComments: "", maxDepth: "", topLevelOnly: false, includeDeleted: false, stripMedia: true, timestamps: false, commentLinks: false, threadStats: true, sort: "score" },
+    full: { style: "compact", minScore: "", maxComments: "", maxDepth: "", topLevelOnly: false, includeDeleted: true, stripMedia: false, timestamps: true, commentLinks: true, threadStats: true, sort: "old" },
+    pulse: { style: "compact", minScore: "", maxComments: "", maxDepth: "0", topLevelOnly: true, includeDeleted: false, stripMedia: true, timestamps: false, commentLinks: false, threadStats: true, sort: "score" },
+    highlights: { style: "compact", minScore: "5", maxComments: "", maxDepth: "", topLevelOnly: false, includeDeleted: false, stripMedia: true, timestamps: false, commentLinks: false, threadStats: true, sort: "score" },
   };
-  walk(thread.comments, 1);
-  return { comments, authors: authors.size, depth, source: thread.source };
-}
+
+  function applyPreset(name) {
+    var p = PRESETS[name];
+    if (!p) return;
+    $("minScore").value = p.minScore;
+    $("maxComments").value = p.maxComments;
+    $("maxDepth").value = p.maxDepth;
+    $("topLevelOnly").checked = p.topLevelOnly;
+    $("includeDeleted").checked = p.includeDeleted;
+    $("stripMedia").checked = p.stripMedia;
+    $("timestamps").checked = p.timestamps;
+    $("commentLinks").checked = p.commentLinks;
+    $("threadStats").checked = p.threadStats;
+    setRadio("style", p.style);
+    setRadio("sort", p.sort);
+    scheduleReformat();
+  }
+
+  function setRadio(name, value) {
+    var el = document.querySelector('input[name="' + name + '"][value="' + value + '"]');
+    if (el) el.checked = true;
+  }
+
+  function switchMode(next) {
+    mode = next;
+    var single = next === "single";
+    $("singlePane").hidden = !single;
+    $("bulkPane").hidden = single;
+    $("jsonBox").hidden = !single;
+    $("tabSingle").classList.toggle("active", single);
+    $("tabBulk").classList.toggle("active", !single);
+    $("exportBtn").textContent = single ? "Export thread" : "Pull subreddit";
+    $("zipBtn").hidden = single;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Wire up                                                             */
+  /* ------------------------------------------------------------------ */
+
+  function onReady() {
+    backend = makeBackend(showProgress);
+
+    $("exportBtn").addEventListener("click", function () {
+      runExport(false);
+    });
+    $("cancelBtn").addEventListener("click", function () {
+      backend.cancel();
+      setStatus("Cancelling…");
+    });
+    $("copyBtn").addEventListener("click", copyOutput);
+    $("jsonBtnDl").addEventListener("click", function (e) {
+      if (mode === "single") {
+        e.preventDefault();
+        downloadJson();
+      }
+    });
+    $("zipBtn").addEventListener("click", function (e) {
+      e.preventDefault();
+      downloadZip();
+    });
+    $("jsonBtn").addEventListener("click", exportFromJson);
+    $("tabSingle").addEventListener("click", function () {
+      switchMode("single");
+    });
+    $("tabBulk").addEventListener("click", function () {
+      switchMode("bulk");
+    });
+    $("url").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") runExport(false);
+    });
+    $("subreddit").addEventListener("keydown", function (e) {
+      if (e.key === "Enter") runExport(false);
+    });
+
+    document.querySelectorAll(".chip").forEach(function (b) {
+      b.addEventListener("click", function () {
+        applyPreset(b.getAttribute("data-preset"));
+      });
+    });
+
+    document.querySelectorAll("#optsPanel input").forEach(function (el) {
+      if (el.id === "loadAll") return; // needs a fresh fetch, not a reformat
+      var evt = el.type === "number" ? "input" : "change";
+      el.addEventListener(evt, scheduleReformat);
+    });
+
+    var preset = new URLSearchParams(location.search);
+    if (preset.get("sub")) {
+      switchMode("bulk");
+      $("subreddit").value = preset.get("sub");
+      if (preset.get("n")) $("bulkCount").value = preset.get("n");
+    } else if (preset.get("url")) {
+      $("url").value = preset.get("url");
+      runExport(false);
+    }
+
+    if (backend.kind === "local") {
+      setStatus("Running in-page (workers unavailable here). Large threads may briefly pause the UI.", "");
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", onReady);
+})();
