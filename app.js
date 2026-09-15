@@ -287,6 +287,10 @@
       setStatus("Paste a Reddit post URL first.", "bad");
       return;
     }
+    // Auto-clean share/UTM clutter before export.
+    var cleaned = RedditMD.canonicalizeInput(input);
+    if (cleaned && cleaned !== input) $("url").value = cleaned;
+    input = $("url").value.trim();
     setBusy(true);
     clearObjectUrls();
     setStatus("Looking up the thread…");
@@ -546,6 +550,16 @@
     });
     $("url").addEventListener("keydown", function (e) {
       if (e.key === "Enter") runExport(false);
+    });
+    $("url").addEventListener("paste", function () {
+      setTimeout(function () {
+        var cleaned = RedditMD.canonicalizeInput($("url").value);
+        if (cleaned && cleaned !== $("url").value.trim()) $("url").value = cleaned;
+      }, 0);
+    });
+    $("url").addEventListener("blur", function () {
+      var cleaned = RedditMD.canonicalizeInput($("url").value);
+      if (cleaned) $("url").value = cleaned;
     });
     $("subreddit").addEventListener("keydown", function (e) {
       if (e.key === "Enter") runExport(false);

@@ -35,6 +35,41 @@ test("parseRedditUrl handles common shapes", () => {
   assert.equal(RedditMD.parseRedditUrl("not a url at all !!"), null);
 });
 
+test("parseRedditUrl cleans app share / UTM clutter", () => {
+  const messy =
+    "https://www.reddit.com/r/apple/comments/1wgwt1r/iphone_18_pro_preorders_off_to_a_muted_start/?share_id=aDoQDHoRvrvVXOZyL9GIR&utm_content=1&utm_medium=ios_app&utm_name=ioscss&utm_source=share&utm_term=1";
+  const p = RedditMD.parseRedditUrl(messy);
+  assert.equal(p.postId, "1wgwt1r");
+  assert.equal(p.subreddit, "apple");
+  assert.equal(p.kind, "comments");
+});
+
+test("parseRedditUrl recognizes iOS share short links", () => {
+  const p = RedditMD.parseRedditUrl("https://www.reddit.com/r/apple/s/I5KvCCY7bE");
+  assert.equal(p.shortPath, "/r/apple/s/I5KvCCY7bE");
+  assert.equal(p.kind, "share");
+  assert.equal(p.postId, null);
+});
+
+test("extractRedditUrl pulls a URL out of pasted share-sheet text", () => {
+  const blob = "Check this out\nhttps://www.reddit.com/r/apple/s/I5KvCCY7bE\nSent from my iPhone";
+  assert.match(RedditMD.extractRedditUrl(blob), /\/r\/apple\/s\/I5KvCCY7bE/);
+});
+
+test("canonicalizeInput strips tracking params", () => {
+  const messy =
+    "https://www.reddit.com/r/apple/comments/1wgwt1r/title/?utm_source=share&share_id=abc";
+  assert.equal(
+    RedditMD.canonicalizeInput(messy),
+    "https://www.reddit.com/r/apple/comments/1wgwt1r/"
+  );
+});
+
+test("scrapePostId finds comments id in HTML-ish text", () => {
+  const html = '<link rel="canonical" href="https://www.reddit.com/r/apple/comments/1wgwt1r/iphone/">';
+  assert.equal(RedditMD.scrapePostId(html), "1wgwt1r");
+});
+
 test("parseSubredditInput normalizes", () => {
   assert.equal(RedditMD.parseSubredditInput("r/AskReddit"), "AskReddit");
   assert.equal(RedditMD.parseSubredditInput("AskReddit"), "AskReddit");

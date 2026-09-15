@@ -66,12 +66,21 @@
 
   function parseId(input) {
     var v = (input || "").trim();
+    // Pull a reddit URL out of messy paste text.
+    var m = v.match(/https?:\/\/(?:www\.|old\.|new\.|np\.|amp\.|m\.)?reddit\.com\/[^\s)\]>'"]+/i) ||
+            v.match(/https?:\/\/redd\.it\/[^\s)\]>'"]+/i) ||
+            v.match(/(?:www\.|old\.|new\.)?reddit\.com\/[^\s)\]>'"]+/i);
+    if (m) v = m[0].replace(/[.,;:!?)]+$/, "");
     if (/^[a-z0-9]{4,10}$/i.test(v)) return v.toLowerCase();
     try {
       if (!/^https?:\/\//i.test(v)) v = "https://" + v;
       var u = new URL(v);
+      // strip tracking
+      ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_name","share_id","ref","ref_source"].forEach(function (k) { u.searchParams.delete(k); });
       if (u.hostname.replace(/^www\./, "") === "redd.it") return u.pathname.replace(/\//g, "").toLowerCase() || null;
       var parts = u.pathname.split("/").filter(Boolean);
+      // share short links need the full app — point people there
+      if (parts[0] === "r" && parts[2] === "s") return { share: "/r/" + parts[1] + "/s/" + parts[3] };
       var at = parts.indexOf("comments");
       if (at >= 0 && parts[at + 1]) return parts[at + 1].toLowerCase();
     } catch (e) {}
@@ -136,7 +145,12 @@
   }
 
   async function run() {
-    var id = parseId($("url").value);
+    var parsed = parseId($("url").value);
+    if (parsed && parsed.share) {
+      setStatus("Share links (/s/…) need the full RedditMD app — open index.html. Or paste the expanded /comments/… URL.", "bad");
+      return;
+    }
+    var id = parsed;
     if (!id) { setStatus("That does not look like a Reddit post URL.", "bad"); return; }
     $("go").disabled = true;
     setStatus("Fetching…");

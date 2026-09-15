@@ -9,7 +9,7 @@
 
   var ARCTIC = "https://arctic-shift.photon-reddit.com/api";
   var PULLPUSH = "https://api.pullpush.io/reddit";
-  var VERSION = "2.0";
+  var VERSION = "2.1";
 
   var enc = encodeURIComponent;
 
@@ -17,27 +17,109 @@
   /* URL / ID parsing                                                    */
   /* ------------------------------------------------------------------ */
 
+  // Pull the first Reddit URL out of messy paste text (share sheets, chat, etc.).
+  function extractRedditUrl(input) {
+    if (!input) return "";
+    var text = String(input).trim();
+    // Prefer share/short or comments URLs if several appear.
+    var patterns = [
+      /https?:\/\/(?:www\.|old\.|new\.|np\.|amp\.|m\.)?reddit\.com\/[^\s)\]>'"]+/gi,
+      /https?:\/\/redd\.it\/[^\s)\]>'"]+/gi,
+      /https?:\/\/(?:www\.)?reddit\.app\.link\/[^\s)\]>'"]+/gi,
+      /(?:^|\s)((?:www\.|old\.|new\.|np\.)?reddit\.com\/[^\s)\]>'"]+)/gi,
+      /(?:^|\s)(redd\.it\/[^\s)\]>'"]+)/gi,
+    ];
+    for (var p = 0; p < patterns.length; p++) {
+      var m = text.match(patterns[p]);
+      if (m && m.length) {
+        var cand = m[0].trim().replace(/[.,;:!?)]+$/, "");
+        if (/^https?:\/\//i.test(cand)) return cand;
+        return "https://" + cand.replace(/^\/*/, "");
+      }
+    }
+    return text;
+  }
+
+  function stripTracking(urlObj) {
+    var drop = [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "utm_name",
+      "share_id",
+      "ref",
+      "ref_source",
+      "ref_campaign",
+      "context",
+      "rdt",
+      "feature",
+      "correlation_id",
+    ];
+    drop.forEach(function (k) {
+      urlObj.searchParams.delete(k);
+    });
+    // Drop leftover empty query.
+    if (![...urlObj.searchParams.keys()].length) urlObj.search = "";
+    return urlObj;
+  }
+
   function parseRedditUrl(input) {
     if (!input) return null;
-    var value = String(input).trim();
+    var value = extractRedditUrl(input);
+    if (!value) return null;
     if (/^[a-z0-9]{4,10}$/i.test(value)) {
-      return { postId: value.toLowerCase(), commentId: null, subreddit: null, shortPath: null };
+      return { postId: value.toLowerCase(), commentId: null, subreddit: null, shortPath: null, kind: "id" };
     }
     try {
-      if (!/^https?:\/\//i.test(value)) value = "https://" + value;
-      var url = new URL(value);
-      var host = url.hostname.replace(/^www\./, "");
+      if (!/^https?:\/\//i.test(value)) value = "https://" + value.replace(/^\/*/, "");
+      var url = stripTracking(new URL(value));
+      var host = url.hostname.replace(/^www\./, "").toLowerCase();
+
+      // redd.it/<id>
       if (host === "redd.it") {
         var rid = url.pathname.replace(/\//g, "");
-        return rid ? { postId: rid.toLowerCase(), commentId: null, subreddit: null, shortPath: null } : null;
+        return rid ? { postId: rid.toLowerCase(), commentId: null, subreddit: null, shortPath: null, kind: "redd.it" } : null;
       }
+
+      // Known Reddit hosts + mobile/share wrappers that keep a reddit path.
+      var redditHost =
+        /(^|\.)reddit\.com$/.test(host) ||
+        host === "reddit.app.link" ||
+        host === "click.redditmail.com";
+
+      if (!redditHost) return null;
+
       var parts = url.pathname.split("/").filter(Boolean);
+
+      // /r/<sub>/s/<code>  (iOS/Android share short links)
+      // /u/<user>/s/<code>
+      // /s/<code>
       if (parts[0] === "r" && parts[2] === "s" && parts[3]) {
-        return { postId: null, commentId: null, subreddit: parts[1], shortPath: "/r/" + parts[1] + "/s/" + parts[3] };
+        return {
+          postId: null,
+          commentId: null,
+          subreddit: parts[1],
+          shortPath: "/r/" + parts[1] + "/s/" + parts[3],
+          kind: "share",
+        };
+      }
+      if (parts[0] === "u" && parts[2] === "s" && parts[3]) {
+        return {
+          postId: null,
+          commentId: null,
+          subreddit: null,
+          shortPath: "/u/" + parts[1] + "/s/" + parts[3],
+          kind: "share",
+        };
       }
       if (parts[0] === "s" && parts[1]) {
-        return { postId: null, commentId: null, subreddit: null, shortPath: "/s/" + parts[1] };
+        return { postId: null, commentId: null, subreddit: null, shortPath: "/s/" + parts[1], kind: "share" };
       }
+
+      // /r/<sub>/comments/<id>/...
+      // /comments/<id>/...
       var at = parts.indexOf("comments");
       if (at >= 0 && parts[at + 1]) {
         return {
@@ -45,10 +127,50 @@
           commentId: parts[at + 3] ? parts[at + 3].toLowerCase() : null,
           subreddit: parts[0] === "r" ? parts[1] : null,
           shortPath: null,
+          kind: "comments",
         };
+      }
+
+      // Gallery / media deep links sometimes still include the post id as a query.
+      var qId = url.searchParams.get("post") || url.searchParams.get("article");
+      if (qId && /^[a-z0-9]{4,10}$/i.test(qId)) {
+        return { postId: qId.toLowerCase(), commentId: null, subreddit: null, shortPath: null, kind: "query" };
       }
     } catch (e) {
       return null;
+    }
+    return null;
+  }
+
+  // Pretty-print a cleaned canonical URL after paste.
+  function canonicalizeInput(input) {
+    var parsed = parseRedditUrl(input);
+    if (!parsed) return extractRedditUrl(input) || String(input || "").trim();
+    if (parsed.shortPath) return "https://www.reddit.com" + parsed.shortPath;
+    if (parsed.postId) {
+      var base = parsed.subreddit
+        ? "https://www.reddit.com/r/" + parsed.subreddit + "/comments/" + parsed.postId + "/"
+        : "https://www.reddit.com/comments/" + parsed.postId + "/";
+      if (parsed.commentId) base += "_/" + parsed.commentId + "/";
+      return base;
+    }
+    return extractRedditUrl(input);
+  }
+
+  function scrapePostId(text) {
+    if (!text) return null;
+    var s = String(text);
+    var patterns = [
+      /https?:\/\/(?:www\.|old\.|new\.|np\.|amp\.|m\.)?reddit\.com\/r\/[^/\s"']+\/comments\/([a-z0-9]{4,10})\b/i,
+      /https?:\/\/(?:www\.|old\.|new\.|np\.|amp\.|m\.)?reddit\.com\/comments\/([a-z0-9]{4,10})\b/i,
+      /\/r\/[^/\s"']+\/comments\/([a-z0-9]{4,10})\b/i,
+      /\/comments\/([a-z0-9]{4,10})\b/i,
+      /"id"\s*:\s*"([a-z0-9]{4,10})"/i,
+      /redd\.it\/([a-z0-9]{4,10})\b/i,
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+      var m = s.match(patterns[i]);
+      if (m) return m[1].toLowerCase();
     }
     return null;
   }
@@ -573,18 +695,110 @@
   /* Acquisition                                                         */
   /* ------------------------------------------------------------------ */
 
+  async function resolveViaArcticShortLinks(shortPath, ctx) {
+    var res = await fetchJson(ARCTIC + "/short_links?paths=" + enc(shortPath), ctx);
+    var rows = (res && res.data) || [];
+    if (!Array.isArray(rows)) rows = [rows];
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (!row) continue;
+      var dest =
+        (typeof row === "string" && row) ||
+        row.resolved_path ||
+        row.url ||
+        row.permalink ||
+        row.path ||
+        null;
+      if (!dest) continue;
+      if (dest.charAt(0) === "/") dest = "https://www.reddit.com" + dest;
+      var next = parseRedditUrl(dest);
+      if (next && next.postId) return next;
+      var scraped = scrapePostId(dest);
+      if (scraped) return { postId: scraped, commentId: null, subreddit: null, shortPath: null, kind: "share" };
+    }
+    return null;
+  }
+
+  // Follow Reddit share redirects through CORS-friendly proxies and scrape the post id.
+  async function resolveViaRedirectProxies(shortPath, ctx) {
+    var target = "https://www.reddit.com" + shortPath;
+    var proxies = [
+      function (u) {
+        return "https://api.allorigins.win/raw?url=" + enc(u);
+      },
+      function (u) {
+        return "https://api.allorigins.win/get?url=" + enc(u);
+      },
+      function (u) {
+        return "https://corsproxy.io/?" + enc(u);
+      },
+      function (u) {
+        return "https://api.codetabs.com/v1/proxy?quest=" + enc(u);
+      },
+    ];
+    for (var i = 0; i < proxies.length; i++) {
+      if (ctx && ctx.signal && ctx.signal.aborted) throw abortError();
+      var ac = new AbortController();
+      var onAbort = function () {
+        ac.abort();
+      };
+      if (ctx && ctx.signal) ctx.signal.addEventListener("abort", onAbort, { once: true });
+      var timer = setTimeout(function () {
+        ac.abort();
+      }, 8000);
+      try {
+        if (ctx && ctx.emit) ctx.emit({ phase: "resolve", message: "Expanding share link…" });
+        var res = await fetch(proxies[i](target), {
+          headers: { Accept: "application/json, text/html, */*" },
+          signal: ac.signal,
+        });
+        if (!res.ok) continue;
+        var text = await res.text();
+        try {
+          var j = JSON.parse(text);
+          if (j && typeof j.contents === "string") text = j.contents;
+          else if (j && typeof j.content === "string") text = j.content;
+        } catch (e) {
+          /* plain text/html */
+        }
+        var id = scrapePostId(text);
+        if (id) return { postId: id, commentId: null, subreddit: null, shortPath: null, kind: "share" };
+      } catch (err) {
+        if (ctx && ctx.signal && ctx.signal.aborted) throw err;
+        continue;
+      } finally {
+        clearTimeout(timer);
+        if (ctx && ctx.signal) ctx.signal.removeEventListener("abort", onAbort);
+      }
+    }
+    return null;
+  }
+
   async function resolvePost(input, ctx) {
     var parsed = parseRedditUrl(input);
     if (!parsed) throw new Error("That does not look like a Reddit post URL.");
     if (parsed.postId) return parsed;
     if (parsed.shortPath) {
-      if (ctx && ctx.emit) ctx.emit({ phase: "resolve", message: "Resolving short link…" });
-      var res = await fetchJson(ARCTIC + "/short_links?paths=" + enc(parsed.shortPath), ctx);
-      var dest = res && res.data ? res.data[parsed.shortPath] || res.data[0] : null;
-      var url = typeof dest === "string" ? dest : dest && (dest.url || dest.permalink);
-      var next = parseRedditUrl(url);
-      if (!next || !next.postId) throw new Error("Could not resolve that Reddit short link.");
-      return next;
+      if (ctx && ctx.emit) ctx.emit({ phase: "resolve", message: "Resolving share link…" });
+      var fromArchive = null;
+      try {
+        fromArchive = await resolveViaArcticShortLinks(parsed.shortPath, ctx);
+      } catch (err) {
+        if (ctx && ctx.signal && ctx.signal.aborted) throw err;
+      }
+      if (fromArchive && fromArchive.postId) return fromArchive;
+
+      var fromProxy = null;
+      try {
+        fromProxy = await resolveViaRedirectProxies(parsed.shortPath, ctx);
+      } catch (err) {
+        if (ctx && ctx.signal && ctx.signal.aborted) throw err;
+      }
+      if (fromProxy && fromProxy.postId) return fromProxy;
+
+      throw new Error(
+        "Couldn't expand that Reddit share link (/s/…). Open it once in your browser, copy the full /comments/… address from the address bar, and paste that. Brand-new share links often aren't archived yet."
+      );
     }
     throw new Error("Could not find a post ID in that URL.");
   }
@@ -988,6 +1202,9 @@
     ARCTIC: ARCTIC,
     PULLPUSH: PULLPUSH,
     parseRedditUrl: parseRedditUrl,
+    extractRedditUrl: extractRedditUrl,
+    canonicalizeInput: canonicalizeInput,
+    scrapePostId: scrapePostId,
     slug: slug,
     filenameFor: filenameFor,
     fmtTime: fmtTime,
