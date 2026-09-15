@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RedditMD</title>
+  <meta name="description" content="Export a Reddit thread to compact markdown for AI analysis." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>R</text></svg>" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="wrap">
+    <header class="hero">
+      <h1>RedditMD</h1>
+      <p>Paste a Reddit post URL. Get the thread as compact markdown you can feed to an AI.</p>
+    </header>
+
+    <label class="field">
+      <span>Reddit post URL</span>
+      <input id="url" type="url" inputmode="url" placeholder="https://www.reddit.com/r/…/comments/…" autocomplete="off" />
+    </label>
+
+    <details class="opts">
+      <summary>Options</summary>
+      <div class="opt-grid">
+        <label><input type="checkbox" id="loadAll" checked /> Pull remaining comments if the first pass is truncated</label>
+        <label><input type="checkbox" id="includeDeleted" /> Keep deleted / removed comments</label>
+        <label><input type="checkbox" id="spaceTop" /> Blank line between top-level comments</label>
+        <fieldset>
+          <legend>Layout</legend>
+          <label><input type="radio" name="style" value="compact" checked /> Compact (best for AI)</label>
+          <label><input type="radio" name="style" value="tree" /> Tree</label>
+          <label><input type="radio" name="style" value="list" /> Nested list</label>
+        </fieldset>
+        <fieldset>
+          <legend>Sort</legend>
+          <label><input type="radio" name="sort" value="score" checked /> Score</label>
+          <label><input type="radio" name="sort" value="new" /> Newest</label>
+          <label><input type="radio" name="sort" value="old" /> Oldest</label>
+        </fieldset>
+      </div>
+    </details>
+
+    <div class="actions">
+      <button id="exportBtn" class="primary" type="button">Export thread</button>
+      <button id="copyBtn" type="button" disabled>Copy</button>
+      <a id="downloadBtn" class="btn" aria-disabled="true">Download .md</a>
+    </div>
+
+    <p id="status" class="status" hidden></p>
+    <p id="stats" class="stats" hidden></p>
+
+    <details id="jsonBox" class="opts">
+      <summary>Paste Reddit JSON instead</summary>
+      <p class="hint">If a brand-new post is missing from the archive, open the post, add <code>.json</code> to the URL, copy everything, and paste it here.</p>
+      <textarea id="jsonInput" rows="6" placeholder='[{"kind":"Listing",...}]'></textarea>
+      <button id="jsonBtn" type="button">Export from JSON</button>
+    </details>
+
+    <section id="outputBlock" hidden>
+      <h2>Markdown</h2>
+      <pre id="output"></pre>
+    </section>
+
+    <footer>
+      <p>Static GitHub Pages tool. Reads public Reddit archives via Arctic Shift, with PullPush as backup. Inspired by <a href="https://github.com/farnots/RedditToMarkdown">farnots/RedditToMarkdown</a>.</p>
+    </footer>
+  </main>
+  <script src="./app.js"></script>
+</body>
+</html>
