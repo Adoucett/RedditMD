@@ -114,6 +114,7 @@
           collapsed: current.index.moreIds.size,
           source: current.index.source,
           capped: view.capped,
+          incomplete: !!current.index.incomplete,
         },
       };
     }
@@ -358,6 +359,7 @@
     ];
     if (s.unplaced) parts.push(s.unplaced + " unplaced");
     if (s.collapsed) parts.push(s.collapsed + " still collapsed");
+    if (s.incomplete) parts.push("archive timed out");
     parts.push(s.source);
     $("stats").textContent = parts.join(" · ");
     var warn = s.collapsed || s.unplaced;

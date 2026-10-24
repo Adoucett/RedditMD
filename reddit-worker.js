@@ -73,6 +73,7 @@ function finishSingle(opts, id) {
       collapsed: current.index.moreIds.size,
       source: current.index.source,
       capped: view.capped,
+      incomplete: !!current.index.incomplete,
     },
   });
 }

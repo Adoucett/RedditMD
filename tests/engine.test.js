@@ -65,6 +65,30 @@ test("canonicalizeInput strips tracking params", () => {
   );
 });
 
+test("Arctic search cursors use accepted ISO dates", () => {
+  assert.equal(RedditMD.arcticDateCursor(0), "1970-01-01T00:00:00.000Z");
+  assert.equal(RedditMD.arcticDateCursor(123), "1970-01-01T00:02:03.000Z");
+  assert.equal(RedditMD.arcticDateCursor(-1), "1970-01-01T00:00:00.000Z");
+});
+
+test("short-link lookups keep path slashes", () => {
+  assert.equal(
+    RedditMD.arcticPathsParam("/r/MiddleClassFinance/s/wukv3V9Eu5"),
+    "/r/MiddleClassFinance/s/wukv3V9Eu5"
+  );
+});
+
+test("share redirects resolve from the Location header or HTML href", () => {
+  const location =
+    "https://www.reddit.com/r/MiddleClassFinance/comments/1xc6t9w/today_i_realized_i_am_a_millionaire_and_i_still/?share_id=abc&utm_source=share";
+  const fromHeader = RedditMD.destinationFromRedirect(location, "");
+  assert.equal(fromHeader.postId, "1xc6t9w");
+  assert.equal(fromHeader.subreddit, "MiddleClassFinance");
+  const body =
+    '<a href="https://www.reddit.com/r/MiddleClassFinance/comments/1xc6t9w/title/?share_id=abc&amp;utm_source=share">Moved Permanently</a>.';
+  assert.equal(RedditMD.destinationFromRedirect("", body).postId, "1xc6t9w");
+});
+
 test("scrapePostId finds comments id in HTML-ish text", () => {
   const html = '<link rel="canonical" href="https://www.reddit.com/r/apple/comments/1wgwt1r/iphone/">';
   assert.equal(RedditMD.scrapePostId(html), "1wgwt1r");

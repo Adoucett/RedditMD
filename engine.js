@@ -9,7 +9,7 @@
 
   var ARCTIC = "https://arctic-shift.photon-reddit.com/api";
   var PULLPUSH = "https://api.pullpush.io/reddit";
-  var VERSION = "2.1";
+  var VERSION = "2.2";
 
   var enc = encodeURIComponent;
 
@@ -656,10 +656,22 @@
       }, timeoutMs);
       try {
         var res = await fetch(url, { headers: { Accept: "application/json" }, signal: ac.signal });
-        if (res.status === 429) {
-          var reset = Number(res.headers.get("x-ratelimit-reset") || res.headers.get("retry-after") || 3);
-          var wait = Math.min(Math.max(reset, 1), 30) * 1000;
-          if (ctx.emit) ctx.emit({ phase: "wait", message: "Rate limited — waiting " + Math.ceil(wait / 1000) + "s…" });
+        if (res.status === 429 || res.status === 422 || res.status === 408) {
+          var limitedBody = "";
+          if (attempt >= tries) {
+            limitedBody = await res.text().catch(function () {
+              return "";
+            });
+            throw new FatalHttp(res.status + " " + limitedBody.slice(0, 120), res.status);
+          }
+          var reset = Number(res.headers.get("x-ratelimit-reset") || res.headers.get("retry-after") || 0);
+          var wait = res.status === 429 ? Math.min(Math.max(reset || 3, 1), 30) * 1000 : Math.min(1500 * attempt, 5000);
+          if (ctx.emit) {
+            ctx.emit({
+              phase: "wait",
+              message: (res.status === 429 ? "Rate limited — waiting " : "Archive is slow — waiting ") + Math.ceil(wait / 1000) + "s…",
+            });
+          }
           clearTimeout(timer);
           if (signal) signal.removeEventListener("abort", onAbort);
           await sleep(wait, signal);
@@ -695,8 +707,34 @@
   /* Acquisition                                                         */
   /* ------------------------------------------------------------------ */
 
+  // Arctic matches short-link paths literally. Encoding the slashes makes a
+  // known link come back as an empty result.
+  function arcticPathsParam(path) {
+    return String(path || "")
+      .split("/")
+      .map(function (part) {
+        return encodeURIComponent(part);
+      })
+      .join("/");
+  }
+
+  function destinationFromRedirect(location, body) {
+    var loc = location || "";
+    if (!loc && body) {
+      var match = String(body).match(/href="([^"]+)"/i);
+      if (match) loc = match[1].replace(/&amp;/g, "&").replace(/&quot;/g, '"');
+    }
+    if (!loc) return null;
+    if (loc.charAt(0) === "/") loc = "https://www.reddit.com" + loc;
+    var parsed = parseRedditUrl(loc);
+    if (parsed && parsed.postId) return parsed;
+    var id = scrapePostId(loc);
+    if (!id) return null;
+    return { postId: id, commentId: null, subreddit: null, shortPath: null, kind: "share" };
+  }
+
   async function resolveViaArcticShortLinks(shortPath, ctx) {
-    var res = await fetchJson(ARCTIC + "/short_links?paths=" + enc(shortPath), ctx);
+    var res = await fetchJson(ARCTIC + "/short_links?paths=" + arcticPathsParam(shortPath), ctx);
     var rows = (res && res.data) || [];
     if (!Array.isArray(rows)) rows = [rows];
     for (var i = 0; i < rows.length; i++) {
@@ -717,6 +755,40 @@
       if (scraped) return { postId: scraped, commentId: null, subreddit: null, shortPath: null, kind: "share" };
     }
     return null;
+  }
+
+  // Reddit answers /r/<sub>/s/<code> with a 301 whose Location (and HTML href)
+  // is the canonical comments URL. Browsers hide that cross-origin redirect;
+  // runtimes that can read it, including this app's tests, resolve it here.
+  async function resolveViaDirectRedirect(shortPath, ctx) {
+    var target = "https://www.reddit.com" + shortPath;
+    if (ctx && ctx.signal && ctx.signal.aborted) throw abortError();
+    var res = await fetch(target, {
+      method: "GET",
+      redirect: "manual",
+      headers: {
+        Accept: "text/html,application/xhtml+xml",
+        "User-Agent":
+          "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+      },
+      signal: ctx && ctx.signal,
+    });
+    if (!res || res.type === "opaqueredirect" || res.status === 0) return null;
+    var loc = "";
+    try {
+      loc = res.headers.get("Location") || "";
+    } catch (e) {
+      loc = "";
+    }
+    var body = "";
+    if (!loc) {
+      try {
+        body = await res.text();
+      } catch (e2) {
+        body = "";
+      }
+    }
+    return destinationFromRedirect(loc, body) || (res.url && res.url !== target ? destinationFromRedirect(res.url, "") : null);
   }
 
   // Follow Reddit share redirects through CORS-friendly proxies and scrape the post id.
@@ -788,17 +860,15 @@
       }
       if (fromArchive && fromArchive.postId) return fromArchive;
 
-      var fromProxy = null;
+      var fromRedirect = null;
       try {
-        fromProxy = await resolveViaRedirectProxies(parsed.shortPath, ctx);
+        fromRedirect = await resolveViaDirectRedirect(parsed.shortPath, ctx);
       } catch (err) {
         if (ctx && ctx.signal && ctx.signal.aborted) throw err;
       }
-      if (fromProxy && fromProxy.postId) return fromProxy;
+      if (fromRedirect && fromRedirect.postId) return fromRedirect;
 
-      throw new Error(
-        "Couldn't expand that Reddit share link (/s/…). Open it once in your browser, copy the full /comments/… address from the address bar, and paste that. Brand-new share links often aren't archived yet."
-      );
+      throw new Error("Couldn't expand that Reddit share link (/s/…).");
     }
     throw new Error("Could not find a post ID in that URL.");
   }
@@ -812,6 +882,15 @@
       step = it.next();
     }
     return out;
+  }
+
+  // Arctic Shift now requires date-form cursor values for search endpoints;
+  // numeric Unix timestamps (including 0) produce HTTP 400. Keep the cursor
+  // internally as seconds so old cached datasets remain compatible.
+  function arcticDateCursor(seconds) {
+    var value = Number(seconds);
+    if (!isFinite(value) || value < 0) value = 0;
+    return new Date(Math.floor(value) * 1000).toISOString();
   }
 
   async function expandAll(index, ctx) {
@@ -837,16 +916,27 @@
 
   async function gapSweep(index, post, ctx) {
     var expected = Number(post && post.num_comments) || 0;
-    var suspect = index.moreIds.size > 0 || (expected > 1 && index.byId.size < expected);
+    var missing = expected > 0 ? expected - index.byId.size : 0;
+    // A one-comment difference is normal (removed comments, a count that moved).
+    // Searching for it is what currently times out and used to fail the export.
+    var suspect = index.moreIds.size > 0 || missing > 1;
     if (!suspect) return;
     var after = index.sweepAfter || 0;
     var guard = 0;
+    var sweepCtx = Object.assign({}, ctx, { tries: 2, timeoutMs: 15000 });
     while (guard < 600 && !aborted(ctx)) {
       guard++;
-      var res = await fetchJson(
-        ARCTIC + "/comments/search?link_id=" + enc(index.postId) + "&limit=100&sort=asc&after=" + after,
-        ctx
-      );
+      var res;
+      try {
+        res = await fetchJson(
+          ARCTIC + "/comments/search?link_id=" + enc(index.postId) + "&limit=100&sort=asc&after=" + enc(arcticDateCursor(after)),
+          sweepCtx
+        );
+      } catch (err) {
+        if (aborted(ctx)) throw err;
+        index.incomplete = true;
+        break;
+      }
       var batch = (res && res.data) || [];
       if (!batch.length) break;
       var maxCreated = after;
@@ -896,8 +986,13 @@
     if (ctx.emit) ctx.emit({ phase: "built", message: "Building thread…", loaded: index.byId.size, collapsed: index.moreIds.size });
 
     if (opts.loadAll) {
-      await expandAll(index, ctx);
-      await gapSweep(index, post, ctx);
+      try {
+        await expandAll(index, ctx);
+        await gapSweep(index, post, ctx);
+      } catch (err) {
+        if (aborted(ctx)) throw err;
+        index.incomplete = true;
+      }
     }
     index.source = "arctic-shift";
     return { post: post, index: index };
@@ -1007,7 +1102,7 @@
         enc(subreddit) +
         "&sort=desc&limit=" +
         pageSize +
-        (before ? "&before=" + before : "");
+        (before !== "" && before != null ? "&before=" + enc(arcticDateCursor(before)) : "");
       var res = await fetchJson(url, ctx);
       var batch = (res && res.data) || [];
       if (!batch.length) break;
@@ -1214,6 +1309,9 @@
     acquirePullpush: acquirePullpush,
     acquireSubreddit: acquireSubreddit,
     searchLatestPosts: searchLatestPosts,
+    arcticDateCursor: arcticDateCursor,
+    arcticPathsParam: arcticPathsParam,
+    destinationFromRedirect: destinationFromRedirect,
     parseSubredditInput: parseSubredditInput,
     renderBulkMarkdown: renderBulkMarkdown,
     makeZipBlob: makeZipBlob,

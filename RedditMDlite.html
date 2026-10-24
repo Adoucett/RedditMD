@@ -80,7 +80,8 @@
       if (u.hostname.replace(/^www\./, "") === "redd.it") return u.pathname.replace(/\//g, "").toLowerCase() || null;
       var parts = u.pathname.split("/").filter(Boolean);
       // share short links need the full app — point people there
-      if (parts[0] === "r" && parts[2] === "s") return { share: "/r/" + parts[1] + "/s/" + parts[3] };
+      if ((parts[0] === "r" || parts[0] === "u") && parts[2] === "s" && parts[3]) return { share: "/" + parts[0] + "/" + parts[1] + "/s/" + parts[3] };
+      if (parts[0] === "s" && parts[1]) return { share: "/s/" + parts[1] };
       var at = parts.indexOf("comments");
       if (at >= 0 && parts[at + 1]) return parts[at + 1].toLowerCase();
     } catch (e) {}
@@ -144,13 +145,39 @@
     return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
   }
 
+  async function resolveShare(shortPath) {
+    try {
+      var lookup = await getJson(ARCTIC + "/short_links?paths=" + shortPath.split("/").map(encodeURIComponent).join("/"));
+      var rows = (lookup && lookup.data) || [];
+      if (!Array.isArray(rows)) rows = [rows];
+      for (var i = 0; i < rows.length; i++) {
+        var dest = rows[i] && (rows[i].resolved_path || rows[i].url || rows[i].permalink);
+        if (!dest) continue;
+        if (dest.charAt(0) === "/") dest = "https://www.reddit.com" + dest;
+        var id = parseId(dest);
+        if (typeof id === "string") return id;
+      }
+    } catch (e) {}
+    try {
+      var res = await fetch("https://www.reddit.com" + shortPath, { redirect: "manual", headers: { Accept: "text/html" } });
+      var loc = res.headers.get("Location") || "";
+      var html = loc ? "" : await res.text();
+      var href = loc || ((html.match(/href="([^"]+)"/) || [])[1] || "").replace(/&amp;/g, "&");
+      if (href.charAt(0) === "/") href = "https://www.reddit.com" + href;
+      var resolved = parseId(href);
+      if (typeof resolved === "string") return resolved;
+    } catch (e2) {}
+    return null;
+  }
+
   async function run() {
     var parsed = parseId($("url").value);
-    if (parsed && parsed.share) {
-      setStatus("Share links (/s/…) need the full RedditMD app — open index.html. Or paste the expanded /comments/… URL.", "bad");
-      return;
-    }
     var id = parsed;
+    if (parsed && parsed.share) {
+      setStatus("Expanding share link…");
+      id = await resolveShare(parsed.share);
+      if (!id) { setStatus("Couldn't expand that share link.", "bad"); return; }
+    }
     if (!id) { setStatus("That does not look like a Reddit post URL.", "bad"); return; }
     $("go").disabled = true;
     setStatus("Fetching…");
