@@ -66,7 +66,7 @@
         <label><input type="checkbox" id="markOp" checked /> Mark OP comments</label>
         <label><input type="checkbox" id="stripMedia" checked /> Strip images / gifs</label>
         <label><input type="checkbox" id="threadStats" checked /> Add a short thread summary for the AI</label>
-        <label><input type="checkbox" id="loadAll" checked /> Pull remaining / collapsed comments</label>
+        <label><input type="checkbox" id="loadAll" /> Try to retrieve missing / collapsed comments (slower)</label>
         <fieldset>
           <legend>Layout</legend>
           <label><input type="radio" name="style" value="compact" checked /> Compact (best for AI)</label>
@@ -79,7 +79,7 @@
           <label><input type="radio" name="sort" value="new" /> Newest</label>
           <label><input type="radio" name="sort" value="old" /> Oldest</label>
         </fieldset>
-        <p class="hint">After a thread loads, changing filters reformats instantly. "Pull remaining / collapsed comments" needs a fresh export.</p>
+        <p class="hint">Exports use the fast comment tree by default. Turn on the slower completeness pass only when you need to chase comments the archive did not include; it needs a fresh export.</p>
       </div>
     </details>
 
